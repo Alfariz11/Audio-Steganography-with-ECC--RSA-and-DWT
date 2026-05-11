@@ -1,2 +1,2 @@
-from .ecc import SimplifiedECCCrypto
-from .rsa import SimpleRSACrypto
+from .ecc import ECCCrypto
+from .rsa import RSACrypto

@@ -1,95 +1,103 @@
 import os
 import hashlib
-import base64
 from Cryptodome.PublicKey import ECC
-from Cryptodome.Random import get_random_bytes
 from Cryptodome.Cipher import AES
-from Cryptodome.Util.Padding import pad, unpad
+from Cryptodome.Hash import SHA256
+from Cryptodome.Protocol.KDF import HKDF
 
-class SimplifiedECCCrypto:
-    def __init__(self):
-
+class ECCCrypto:
+    """
+    Implements secure ECC encryption using ECIES-style key agreement.
+    Uses ECDH to derive a shared secret and HKDF to generate an AES key.
+    """
+    def __init__(self, curve='P-256'):
+        self.curve = curve
         self.key = None
         self.generate_key()
     
     def generate_key(self):
-
-        self.key = ECC.generate(curve='P-256')
+        """Generates a new ECC key pair."""
+        self.key = ECC.generate(curve=self.curve)
         return self.key
     
     def get_public_key(self):
-
+        """Exports public key in PEM format."""
         if not self.key:
             self.generate_key()
         return self.key.public_key().export_key(format='PEM')
     
     def get_private_key(self):
-
+        """Exports private key in PEM format."""
         if not self.key:
             self.generate_key()
         return self.key.export_key(format='PEM')
     
-    def encrypt_text(self, plaintext):
-        # Buat kunci sesi acak untuk AES
-        session_key = get_random_bytes(16)
-        
-        # Enkripsi menggunakan AES
-        cipher = AES.new(session_key, AES.MODE_CBC)
-        ciphertext = cipher.encrypt(pad(plaintext.encode('utf-8'), AES.block_size))
-        
-        # Tambahkan IV ke ciphertext
-        encrypted_data = cipher.iv + ciphertext
-        
-        # Untuk implementasi sederhana, bukannya mengenkripsi session_key dengan ECC,
-        # kita hanya akan mengembalikan session_key langsung
-        # Di aplikasi nyata, session_key harus dienkripsi dengan kunci publik penerima
-        
-        # Konversi ke base64 untuk memudahkan penanganan
-        encrypted_data_base64 = base64.b64encode(encrypted_data).decode('utf-8')
-        session_key_base64 = base64.b64encode(session_key).decode('utf-8')
-        
-        return encrypted_data_base64, session_key_base64
-    
     def load_key(self, key_str, is_private=True):
-
+        """Loads an ECC key from a string."""
         try:
-            if is_private:
-                self.key = ECC.import_key(key_str)
-            else:
-                self.key = ECC.import_key(key_str)
+            self.key = ECC.import_key(key_str)
             return True
         except Exception as e:
-            print(f"Error saat memuat kunci ECC: {str(e)}")
+            print(f"Error loading ECC key: {str(e)}")
             return False
-    
-    def decrypt_text(self, encrypted_data_base64, session_key_base64):
-        try:
-            # Dekode dari base64
-            encrypted_data = base64.b64decode(encrypted_data_base64)
-            session_key = base64.b64decode(session_key_base64)
-            
-            # Pisahkan IV dan ciphertext
-            iv = encrypted_data[:16]
-            ciphertext = encrypted_data[16:]
-            
-            # Dekripsi menggunakan AES
-            try:
-                cipher = AES.new(session_key, AES.MODE_CBC, iv)
-                plaintext = unpad(cipher.decrypt(ciphertext), AES.block_size)
-                return plaintext.decode('utf-8')
-            except ValueError as e:
-                if "padding is incorrect" in str(e):
-                    print("[DEBUG] ECC/AES: Padding tidak valid - kemungkinan data rusak")
-                    raise ValueError("Padding AES tidak valid, data mungkin rusak") from e
-                else:
-                    print(f"[DEBUG] ECC/AES: Error dekripsi: {str(e)}")
-                    raise
-        except Exception as e:
-            print(f"[DEBUG] ECC Dekripsi gagal: {type(e).__name__}: {str(e)}")
-            raise
-    
-    def hash_message(self, message):
 
+    def encrypt_session_key(self, session_key, recipient_public_key_pem):
+        """
+        Encrypts a session key using the recipient's public key via ECDH.
+        Returns: (ephemeral_public_key_bytes, encrypted_session_key, iv, tag)
+        """
+        recipient_key = ECC.import_key(recipient_public_key_pem)
+        
+        # 1. Generate ephemeral key pair
+        ephemeral_key = ECC.generate(curve=self.curve)
+        ephemeral_pub_bytes = ephemeral_key.public_key().export_key(format='DER')
+        
+        # 2. ECDH Key Agreement
+        # shared_point = ephemeral_private_key * recipient_public_key
+        shared_secret = self._derive_shared_secret(ephemeral_key, recipient_key)
+        
+        # 3. KDF to derive encryption key for the session key
+        # We use HKDF to derive a 256-bit key
+        derived_key = HKDF(shared_secret, 32, b'', SHA256)
+        
+        # 4. Encrypt the session key using AES-GCM
+        cipher = AES.new(derived_key, AES.MODE_GCM)
+        ciphertext, tag = cipher.encrypt_and_digest(session_key)
+        
+        return ephemeral_pub_bytes, ciphertext, cipher.nonce, tag
+
+    def decrypt_session_key(self, ephemeral_pub_bytes, encrypted_session_key, nonce, tag):
+        """
+        Decrypts the session key using the private key.
+        """
+        if not self.key or not self.key.has_private():
+            raise ValueError("Private key is required for decryption")
+            
+        ephemeral_pub_key = ECC.import_key(ephemeral_pub_bytes)
+        
+        # 1. ECDH Key Agreement
+        # shared_point = private_key * ephemeral_public_key
+        shared_secret = self._derive_shared_secret(self.key, ephemeral_pub_key)
+        
+        # 2. KDF to derive the same encryption key
+        derived_key = HKDF(shared_secret, 32, b'', SHA256)
+        
+        # 3. Decrypt the session key
+        cipher = AES.new(derived_key, AES.MODE_GCM, nonce=nonce)
+        try:
+            session_key = cipher.decrypt_and_verify(encrypted_session_key, tag)
+            return session_key
+        except ValueError:
+            raise ValueError("ECC decryption failed: MAC check failed")
+
+    def _derive_shared_secret(self, private_key, public_key):
+        """Performs ECDH and returns the x-coordinate as the shared secret."""
+        # Shared point = d * Q
+        shared_point = public_key.pointQ * private_key.d
+        # Convert x-coordinate to bytes
+        return int(shared_point.x).to_bytes(32, 'big')
+
+    def hash_message(self, message):
         if isinstance(message, str):
             message = message.encode('utf-8')
-        return hashlib.sha256(message).hexdigest() 
+        return hashlib.sha256(message).digest()

@@ -1,386 +1,276 @@
 import os
-import json
-import base64
+import zlib
+import struct
 import numpy as np
 import soundfile as sf
 from PIL import Image
+from reedsolo import RSCodec
 
-# Modul lokal
+# Local modules
 from steg import AudioDWT
-from crypto import SimplifiedECCCrypto, SimpleRSACrypto
-from utils import text_to_bits, bits_to_text
+from crypto.ecc import ECCCrypto
+from crypto.rsa import RSACrypto
+from Cryptodome.Random import get_random_bytes
+from Cryptodome.Cipher import AES
 
-
-def image_to_base64(image_path):
-
-    with open(image_path, "rb") as img_file:
-        return base64.b64encode(img_file.read()).decode('utf-8')
-    
 def generate_audio(output_file, duration=10, sample_rate=44100):
-
+    """Generates a sample sine wave audio file."""
     t = np.linspace(0, duration, int(sample_rate * duration), endpoint=False)
     audio_data = 0.5 * np.sin(2 * np.pi * 440 * t)
     sf.write(output_file, audio_data, sample_rate)
-    print(f"File audio sampel dibuat: {output_file}")
+    print(f"Sample audio file created: {output_file}")
     return output_file
 
+def prepare_payload(message, ecc_recipient_pub_pem, rsa_signer):
+    """
+    Prepares the payload: Compress -> Encrypt (AES-GCM) -> Encrypt Key (ECC) -> Sign (RSA)
+    Returns: Raw bytes of the complete protected package.
+    """
+    # 1. Compression
+    if isinstance(message, str):
+        message = message.encode('utf-8')
+    compressed_data = zlib.compress(message)
+    
+    # 2. AES-256-GCM Encryption
+    session_key = get_random_bytes(32)  # AES-256
+    cipher_aes = AES.new(session_key, AES.MODE_GCM)
+    encrypted_payload, aes_tag = cipher_aes.encrypt_and_digest(compressed_data)
+    aes_nonce = cipher_aes.nonce
+    
+    # 3. ECC (ECIES) Encryption of Session Key
+    ecc = ECCCrypto()
+    eph_pub, ecc_ct, ecc_nonce, ecc_tag = ecc.encrypt_session_key(session_key, ecc_recipient_pub_pem)
+    
+    # 4. RSA Digital Signature
+    # We sign the encrypted payload + AES metadata + ECC metadata
+    data_to_sign = eph_pub + ecc_ct + ecc_nonce + ecc_tag + aes_nonce + aes_tag + encrypted_payload
+    signature = rsa_signer.sign_data(data_to_sign)
+    
+    # 5. Pack into binary format
+    # [EphPubLen 2b][EphPub][ECC_CTLen 2b][ECC_CT][ECC_Nonce 16b][ECC_Tag 16b][RSA_Sig 256b][AES_Nonce 16b][AES_Tag 16b][EncryptedPayload]
+    package = struct.pack(">H", len(eph_pub)) + eph_pub
+    package += struct.pack(">H", len(ecc_ct)) + ecc_ct
+    package += ecc_nonce + ecc_tag
+    package += signature # 256 bytes for 2048-bit RSA
+    package += aes_nonce + aes_tag
+    package += encrypted_payload
+    
+    return package
 
-def prepare_message(message):
+def apply_error_correction(data, parity_bytes=32):
+    """Applies Reed-Solomon error correction."""
+    rsc = RSCodec(parity_bytes)
+    return bytes(rsc.encode(data))
 
-    # Buat instance ECC
-    print("Membuat kunci ECC...")
-    ecc_crypto = SimplifiedECCCrypto()
-    print("Kunci ECC dibuat")
+def remove_error_correction(data, parity_bytes=32):
+    """Decodes Reed-Solomon error correction."""
+    rsc = RSCodec(parity_bytes)
+    try:
+        decoded = rsc.decode(data)[0]
+        return bytes(decoded)
+    except Exception as e:
+        print(f"RS Decoding failed: {e}")
+        return None
 
-    # Enkripsi pesan dengan ECC terlebih dahulu
-    print("Menyiapkan enkripsi pertama dengan ECC...")
-    ecc_encrypted_data_base64, ecc_key_base64 = ecc_crypto.encrypt_text(message)
-
-    # Buat instance RSA
-    print("Membuat kunci RSA (ini mungkin memakan waktu)...")
-    rsa_crypto = SimpleRSACrypto()
-    print("Kunci RSA dibuat")
-
-    # Enkripsi hasil ECC dengan RSA
-    print("Menyiapkan enkripsi kedua dengan RSA...")
-    combined_message = json.dumps({
-        "ecc_data": ecc_encrypted_data_base64,
-        "ecc_key": ecc_key_base64
-    })
-
-    rsa_encrypted_data_base64, rsa_key_base64 = rsa_crypto.encrypt_text(combined_message)
-
-    # Buat data header
-    header = {
-        "ecc_public_key": ecc_crypto.get_public_key(),
-        "rsa_public_key": rsa_crypto.get_public_key(),
-        "message_length": len(message),
-        "rsa_key": rsa_key_base64
-    }
-
-    # Serialisasi header dan data terenkripsi
-    header_json = json.dumps(header)
-    message_json = json.dumps(rsa_encrypted_data_base64)
-
-    # Konversi ke data biner
-    header_bits = text_to_bits(header_json)
-    message_bits = text_to_bits(message_json)
-
-    # Tambahkan panjang header (32 bit)
-    header_length_bits = format(len(header_bits), '032b')
-
-    # Gabungkan semua bit
-    all_bits = header_length_bits + header_bits + message_bits
-
-    return all_bits, ecc_crypto, rsa_crypto
-
-
-def embed_message(input_file=None, output_file=None, message=None, alpha=0.001, is_image=False):
-
+def embed_message(input_file=None, output_file=None, message=None, alpha=0.001, is_image=False, rs_parity=32):
+    """
+    Complete embedding workflow.
+    """
     os.makedirs('output', exist_ok=True)
-
-    if input_file is None:
-        input_file = input("Masukkan path file audio asli (atau kosong untuk buat sampel): ").strip()
+    
     if not input_file:
         input_file = 'output/sample.wav'
-        generate_audio(input_file)
-
-    if output_file is None:
-        output_file = input("Masukkan path file output (default: output/stego.wav): ").strip()
+        if not os.path.exists(input_file):
+            generate_audio(input_file)
+            
     if not output_file:
         output_file = 'output/stego.wav'
 
     if message is None:
-        if is_image:
-            message = input("Masukkan path gambar: ")
-        else:
-            message = input("Masukkan pesan: ")
+        return None
 
     if is_image:
-        print(f"Memproses gambar: {message}")
-        try:
-            message = image_to_base64(message)
-        except Exception as e:
-            print(f"Gagal membaca gambar: {e}")
-            return None
-
-    if not message:
-        print("Pesan tidak boleh kosong")
-        return None
-
-    if alpha is None:
-        alpha_str = input("Masukkan nilai alpha DWT (default 0.001): ").strip()
-        alpha = 0.001
-        if alpha_str:
-            try:
-                alpha = float(alpha_str)
-            except ValueError:
-                print("Nilai alpha tidak valid, menggunakan default 0.001")
-    print(f"Menggunakan alpha = {alpha}")
-
-    try:
-        print("Menyiapkan pesan dengan enkripsi ganda ECC dan RSA...")
-        all_bits, ecc_crypto, rsa_crypto = prepare_message(message)
-        print(f"Pesan terenkripsi dengan panjang bit: {len(all_bits)} bit")
-
-        dwt = AudioDWT(wavelet='db2', level=1)
-
-        audio_data, sample_rate = dwt.read_audio(input_file)
-        coeffs = dwt.apply_dwt(audio_data)
-
-        capacity = len(coeffs[1])
-        if len(all_bits) > capacity:
-            print(f"Pesan terlalu panjang!, Kapasitas maksimal: {capacity} bit, "
-                  f"Pesan terenkripsi: {len(all_bits)} bit")
-            return None
-
-        modified_coeffs = dwt.embed_bits_in_coefficients(coeffs, all_bits, alpha=alpha)
-        reconstructed_data = dwt.apply_idwt(modified_coeffs)
-
-        if len(audio_data.shape) > 1 and audio_data.shape[1] > 1:
-            min_len = min(len(reconstructed_data), len(audio_data))
-            reconstructed_stereo = np.zeros((min_len, audio_data.shape[1]))
-            reconstructed_stereo[:, 0] = reconstructed_data[:min_len]
-            for ch in range(1, audio_data.shape[1]):
-                reconstructed_stereo[:, ch] = audio_data[:min_len, ch]
-            reconstructed_data = reconstructed_stereo
-
-        dwt.save_audio(output_file, reconstructed_data, sample_rate)
-        print(f"Pesan telah berhasil disembunyikan dalam file: {output_file}")
-
-        key_file = output_file + ".key"
-        with open(key_file, 'w') as f:
-            f.write("== KUNCI ECC ==\n")
-            f.write(f"PUBLIC KEY ECC:\n{ecc_crypto.get_public_key()}\n")
-            f.write(f"PRIVATE KEY ECC:\n{ecc_crypto.get_private_key()}\n")
-            f.write("== KUNCI RSA ==\n")
-            f.write(f"PUBLIC KEY RSA:\n{rsa_crypto.get_public_key()}\n")
-            f.write(f"PRIVATE KEY RSA:\n{rsa_crypto.get_private_key()}\n")
-
-        info_file = output_file + ".info"
-        info = {
-            "bits_length": len(all_bits),
-            "ecc_public_key": ecc_crypto.get_public_key(),
-            "ecc_private_key": ecc_crypto.get_private_key(),
-            "rsa_public_key": rsa_crypto.get_public_key(),
-            "rsa_private_key": rsa_crypto.get_private_key(),
-            "message_length": len(message),
-            "alpha": alpha
-        }
-        with open(info_file, 'w') as f:
-            json.dump(info, f)
-
-        print(f"Kunci disimpan di: {key_file}")
-        print(f"Informasi tambahan di: {info_file}")
-        return output_file
-
-    except Exception as e:
-        print(f"Error saat menyiapkan pesan: {e}")
-        return None
-
-
-def extract_message(stego_file=None):
-    from crypto import SimpleRSACrypto, SimplifiedECCCrypto
-    from utils import bits_to_text
-
-    if stego_file is None:
-        stego_file = input("Masukkan path file audio stego: ").strip()
-    if not stego_file or not os.path.exists(stego_file):
-        print("File tidak ditemukan")
-        return None
-
-    info_file = stego_file + ".info"
-    ecc_private_key = None
-    rsa_private_key = None
-    alpha = 0.001
-
-    if os.path.exists(info_file):
-        try:
-            with open(info_file, 'r') as f:
-                info = json.load(f)
-            num_bits = info["bits_length"]
-            ecc_private_key = info.get("ecc_private_key")
-            rsa_private_key = info.get("rsa_private_key")
-            if "alpha" in info:
-                alpha = info["alpha"]
-            print(f"Menggunakan alpha dari file info: {alpha}")
-        except json.JSONDecodeError:
-            num_bits = int(input("Jumlah bit pesan: "))
+        with open(message, "rb") as f:
+            message_data = f.read()
     else:
-        num_bits = int(input("Jumlah bit pesan: "))
+        message_data = message.encode('utf-8')
 
+    # Initialize cryptos
+    ecc = ECCCrypto()
+    rsa = RSACrypto()
+    
+    # Prepare payload
+    print("Preparing encrypted payload...")
+    package = prepare_payload(message_data, ecc.get_public_key(), rsa)
+    
+    # Apply Reed-Solomon
+    print(f"Applying Reed-Solomon error correction (parity={rs_parity})...")
+    rs_package = apply_error_correction(package, rs_parity)
+    
+    # Convert to bits
     dwt = AudioDWT(wavelet='db2', level=1)
-
-    try:
-        stego_data, sample_rate = dwt.read_audio(stego_file)
-        coeffs = dwt.apply_dwt(stego_data)
-        all_extracted_bits = dwt.extract_bits_from_coefficients(coeffs, num_bits, alpha=alpha)
-
-        if len(all_extracted_bits) < 32:
-            print("Data ekstraksi terlalu pendek!")
-            return None
-
-        header_length_bits = all_extracted_bits[:32]
-        try:
-            header_length = int(header_length_bits, 2)
-        except ValueError:
-            print(f"Bit header tidak valid: {header_length_bits}")
-            return None
-
-        if len(all_extracted_bits) < 32 + header_length:
-            print("Header tidak lengkap!")
-            return None
-
-        header_bits = all_extracted_bits[32:32 + header_length]
-        header_json = bits_to_text(header_bits)
-
-        try:
-            header = json.loads(header_json)
-            ecc_public_key = header["ecc_public_key"]
-            rsa_public_key = header["rsa_public_key"]
-            message_length = header["message_length"]
-            rsa_key_base64 = header["rsa_key"]
-        except (json.JSONDecodeError, KeyError) as e:
-            print(f"Error parsing header: {e}")
-            return None
-
-        message_bits = all_extracted_bits[32 + header_length:]
-        message_json = bits_to_text(message_bits)
-
-        try:
-            rsa_encrypted_data_base64 = json.loads(message_json)
-        except json.JSONDecodeError:
-            print("Gagal parse pesan terenkripsi.")
-            return None
-
-        rsa_crypto = SimpleRSACrypto()
-        if rsa_private_key:
-            rsa_crypto.load_key(rsa_private_key)
-
-        try:
-            combined_message = rsa_crypto.decrypt_text(rsa_encrypted_data_base64, rsa_key_base64)
-            combined_data = json.loads(combined_message)
-            ecc_encrypted_data_base64 = combined_data["ecc_data"]
-            ecc_key_base64 = combined_data["ecc_key"]
-
-            ecc_crypto = SimplifiedECCCrypto()
-            if ecc_private_key:
-                ecc_crypto.load_key(ecc_private_key)
-
-            decrypted_message = ecc_crypto.decrypt_text(ecc_encrypted_data_base64, ecc_key_base64)
-            print(f"\nPesan yang diekstrak:\n{decrypted_message}")
-            return decrypted_message
-
-        except Exception as e:
-            print(f"Gagal dekripsi layer RSA: {e}")
-            return None
-
-    except Exception as e:
-        print(f"Error ekstraksi: {e}")
+    bits = dwt.bytes_to_bits(rs_package)
+    
+    # Add header: [RS_Package_Length 4 bytes]
+    header = format(len(rs_package), '032b')
+    all_bits = header + bits
+    
+    print(f"Embedding {len(all_bits)} bits into audio...")
+    
+    # Audio processing
+    audio_data, sample_rate = dwt.read_audio(input_file)
+    coeffs = dwt.apply_dwt(audio_data)
+    
+    if len(all_bits) > len(coeffs[1]):
+        print(f"Error: Message too large. Capacity: {len(coeffs[1])} bits, Needed: {len(all_bits)} bits.")
         return None
+        
+    modified_coeffs = dwt.embed_bits_in_coefficients(coeffs, all_bits, alpha=alpha)
+    reconstructed_data = dwt.apply_idwt(modified_coeffs)
     
-def debug_extract(stego_file=None, num_bits=None):
+    # Handle stereo
+    if len(audio_data.shape) > 1 and audio_data.shape[1] > 1:
+        min_len = min(len(reconstructed_data), len(audio_data))
+        reconstructed_stereo = np.zeros((min_len, audio_data.shape[1]))
+        reconstructed_stereo[:, 0] = reconstructed_data[:min_len]
+        for ch in range(1, audio_data.shape[1]):
+            reconstructed_stereo[:, ch] = audio_data[:min_len, ch]
+        reconstructed_data = reconstructed_stereo
+        
+    dwt.save_audio(output_file, reconstructed_data, sample_rate)
+    
+    # Save keys/info for extraction
+    info_file = output_file + ".info"
+    import json
+    info = {
+        "rs_parity": rs_parity,
+        "ecc_private_key": ecc.get_private_key(),
+        "rsa_public_key": rsa.get_public_key(),
+        "alpha": alpha,
+        "is_image": is_image
+    }
+    
+    with open(info_file, 'w') as f:
+        json.dump(info, f)
+        
+    # Also save keys in a human readable format
+    with open(output_file + ".key", 'w') as f:
+        f.write("=== ECC PRIVATE KEY (KEEP SECRET) ===\n")
+        f.write(ecc.get_private_key())
+        f.write("\n\n=== RSA PUBLIC KEY (FOR VERIFICATION) ===\n")
+        f.write(rsa.get_public_key())
+        f.write("\n\n=== RSA PRIVATE KEY (FOR SIGNING) ===\n")
+        f.write(rsa.get_private_key())
 
-    # Tanya nama file audio stego jika tidak diberikan
-    if stego_file is None:
-        stego_file = input("Masukkan path file audio yang akan di-debug: ").strip()
+    print(f"Success! Stego audio saved to {output_file}")
+    return output_file
+
+def extract_message(stego_file, ecc_private_key_pem=None, rsa_public_key_pem=None):
+    """
+    Complete extraction workflow.
+    """
+    info_file = stego_file + ".info"
+    rs_parity = 32
+    alpha = 0.001
+    is_image = False
     
-    if not stego_file or not os.path.exists(stego_file):
-        print("File tidak ditemukan")
-        return
-    
-    # Cek apakah ada file info untuk mendapatkan jumlah bit
-    if num_bits is None:
-        info_file = stego_file + ".info"
-        if os.path.exists(info_file):
-            try:
-                with open(info_file, 'r') as f:
-                    info = json.load(f)
-                num_bits = info["bits_length"]
-                print(f"Jumlah bit dari file info: {num_bits}")
-            except Exception as e:
-                print(f"Error membaca file info: {str(e)}")
-                num_bits = int(input("Masukkan jumlah bit yang akan diekstrak untuk debug: "))
-        else:
-            num_bits = int(input("Masukkan jumlah bit yang akan diekstrak untuk debug: "))
-    
-    # Buat instance DWT
+    import json
+    if os.path.exists(info_file):
+        with open(info_file, 'r') as f:
+            info = json.load(f)
+            rs_parity = info.get("rs_parity", 32)
+            alpha = info.get("alpha", 0.001)
+            is_image = info.get("is_image", False)
+            if not ecc_private_key_pem:
+                ecc_private_key_pem = info.get("ecc_private_key")
+            if not rsa_public_key_pem:
+                rsa_public_key_pem = info.get("rsa_public_key")
+
     dwt = AudioDWT(wavelet='db2', level=1)
+    audio_data, sample_rate = dwt.read_audio(stego_file)
+    coeffs = dwt.apply_dwt(audio_data)
     
+    # 1. Extract length header (32 bits)
+    header_bits = dwt.extract_bits_from_coefficients(coeffs, 32, alpha=alpha)
+    rs_package_len = int(header_bits, 2)
+    
+    # 2. Extract RS package bits
+    total_bits_needed = 32 + (rs_package_len * 8)
+    all_bits = dwt.extract_bits_from_coefficients(coeffs, total_bits_needed, alpha=alpha)
+    rs_package_bits = all_bits[32:]
+    rs_package = dwt.bits_to_bytes(rs_package_bits)
+    
+    # 3. Reed-Solomon Decode
+    print("Decoding Reed-Solomon...")
+    package = remove_error_correction(rs_package, rs_parity)
+    if not package:
+        print("Error: Could not recover data even with Reed-Solomon.")
+        return None
+        
+    # 4. Unpack binary format
     try:
-        # Ekstrak bit dari file audio
-        print(f"Mengekstrak {num_bits} bit dari file...")
+        offset = 0
+        eph_pub_len = struct.unpack(">H", package[offset:offset+2])[0]
+        offset += 2
+        eph_pub = package[offset:offset+eph_pub_len]
+        offset += eph_pub_len
         
-        # Baca file audio stego
-        stego_data, sample_rate = dwt.read_audio(stego_file)
+        ecc_ct_len = struct.unpack(">H", package[offset:offset+2])[0]
+        offset += 2
+        ecc_ct = package[offset:offset+ecc_ct_len]
+        offset += ecc_ct_len
         
-        # Terapkan DWT
-        coeffs = dwt.apply_dwt(stego_data)
+        ecc_nonce = package[offset:offset+16]
+        offset += 16
+        ecc_tag = package[offset:offset+16]
+        offset += 16
         
-        # Ekstrak bit dengan alpha default
-        alpha = 0.001  # Nilai alpha default untuk debug
-        all_extracted_bits = dwt.extract_bits_from_coefficients(coeffs, num_bits, alpha=alpha)
+        signature = package[offset:offset+256]
+        offset += 256
         
-        print(f"Jumlah bit yang berhasil diekstrak: {len(all_extracted_bits)}")
+        aes_nonce = package[offset:offset+16]
+        offset += 16
+        aes_tag = package[offset:offset+16]
+        offset += 16
         
-        if len(all_extracted_bits) < 32:
-            print("ERROR: Data terlalu pendek! Minimal 32 bit diperlukan untuk header.")
-            return
+        encrypted_payload = package[offset:]
         
-        # Baca panjang header
-        header_length_bits = all_extracted_bits[:32]
-        try:
-            header_length = int(header_length_bits, 2)
-            print(f"Panjang header: {header_length} bit")
-        except ValueError:
-            print(f"ERROR: Bit header panjang tidak valid: {header_length_bits}")
-            return
+        # 5. Verify RSA Signature
+        print("Verifying RSA signature...")
+        data_to_verify = eph_pub + ecc_ct + ecc_nonce + ecc_tag + aes_nonce + aes_tag + encrypted_payload
+        rsa = RSACrypto()
+        if not rsa.verify_signature(data_to_verify, signature, rsa_public_key_pem):
+            print("Warning: RSA signature verification failed! Data might be tampered.")
+        else:
+            print("RSA signature verified.")
+            
+        # 6. Decrypt Session Key with ECC
+        print("Decrypting session key with ECC...")
+        ecc = ECCCrypto()
+        ecc.load_key(ecc_private_key_pem)
+        session_key = ecc.decrypt_session_key(eph_pub, ecc_ct, ecc_nonce, ecc_tag)
         
-        # Cek panjang data
-        if len(all_extracted_bits) < 32 + header_length:
-            print(f"ERROR: Data terlalu pendek! Butuh {32 + header_length} bit, hanya ada {len(all_extracted_bits)} bit.")
-            return
+        # 7. Decrypt Payload with AES-GCM
+        print("Decrypting payload with AES-GCM...")
+        cipher_aes = AES.new(session_key, AES.MODE_GCM, nonce=aes_nonce)
+        compressed_data = cipher_aes.decrypt_and_verify(encrypted_payload, aes_tag)
         
-        # Ekstrak header
-        header_bits = all_extracted_bits[32:32+header_length]
-        header_text = bits_to_text(header_bits)
+        # 8. Decompress
+        original_data = zlib.decompress(compressed_data)
         
-        print("\n===== HEADER TERekstrak (3 baris pertama) =====")
-        header_lines = header_text.split('\n')
-        for i in range(min(3, len(header_lines))):
-            print(header_lines[i])
-        
-        try:
-            header = json.loads(header_text)
-            print("\n== HEADER DIPARSE DENGAN SUKSES ==")
-            print(f"Message length: {header.get('message_length', 'N/A')}")
-            if 'ecc_public_key' in header:
-                print("ECC public key tersedia")
-            if 'rsa_public_key' in header:
-                print("RSA public key tersedia")
-            if 'rsa_key' in header:
-                print("RSA session key tersedia")
-        except json.JSONDecodeError as e:
-            print(f"\nERROR: Gagal mem-parse header JSON: {str(e)}")
-            print(f"Header JSON raw: {header_text[:100]}...")
-        
-        # Ekstrak message
-        if len(all_extracted_bits) <= 32 + header_length:
-            print("ERROR: Tidak ada data pesan!")
-            return
-        
-        message_bits = all_extracted_bits[32+header_length:]
-        message_text = bits_to_text(message_bits)
-        
-        print("\n== PESAN TERENKRIPSI (awal) ==")
-        print(message_text[:100] + "..." if len(message_text) > 100 else message_text)
-        
-        try:
-            message_json = json.loads(message_text)
-            print("\n== PESAN BERHASIL DIPARSE ==")
-            print("Pesan dalam format JSON yang valid")
-        except json.JSONDecodeError as e:
-            print(f"\nERROR: Gagal mem-parse pesan JSON: {str(e)}")
+        if is_image:
+            output_img = "output/extracted_image.png"
+            with open(output_img, "wb") as f:
+                f.write(original_data)
+            print(f"Extracted image saved to {output_img}")
+            return output_img
+        else:
+            message = original_data.decode('utf-8')
+            print(f"Extracted message: {message}")
+            return message
             
     except Exception as e:
-        print(f"ERROR: {str(e)}")
+        print(f"Extraction failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
